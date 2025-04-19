@@ -12,6 +12,24 @@
 #define ERROR_REINITIALIZATION -8
 #define ERROR_RXNE -9
 #define ERROR_BUSY_BUS -10
+#define ERROR_NOT_INITIALIZED -11
+
+/* I2C Control Register 1 (CR1) */
+#define I2C_CR1_START       (1 << 8)   // Bit 8: START generation 
+#define I2C_CR1_STOP        (1 << 9)   // Bit 9: STOP generation 
+#define I2C_CR1_ACK         (1 << 10)  // Bit 10: Acknowledge enable 
+#define I2C_CR1_PE          (1 << 0)   // Bit 0: Peripheral enable
+
+/* I2C Status Register 1 (SR1) */
+#define I2C_SR1_SB          (1 << 0)   // Bit 0: Start bit (Master mode) 
+#define I2C_SR1_ADDR        (1 << 1)   // Bit 1: Address sent (master)/matched (slave)
+#define I2C_SR1_BTF         (1 << 2)   // Bit 2: Byte Transfer Finished 
+#define I2C_SR1_RXNE        (1 << 6)   // Bit 6: Receive data register not empty 
+#define I2C_SR1_TXE         (1 << 7)   // Bit 7: Transmit data register empty 
+#define I2C_SR1_ACK_FAIL    (1 << 10)  // Bit 10: Acknowledge failure 
+
+/* I2C Status Register 2 (SR2) */
+#define I2C_SR2_BUSY        (1 << 1)   /* Bit 1: Bus busy */
 
 // base addresses for peripherals
 #define RCC_BASE 0x40023800 // RCC register base address
@@ -40,7 +58,7 @@
 #define I2C1_DR (*(volatile uint32_t*)(I2C1_BASE+0x10)) // Data Register
 
 // I2C Timing Configuration
-#define I2C_FREQ_MHZ 42                                               // Core clock frequency (MHz)
+#define I2C_FREQ_MHZ 36                                               // Core clock frequency for I2C1 (MHz)
 #define I2C_SPEED_HZ 100000                                           // I2C bus speed (100kHz standard mode)
 #define I2C_CCR_VAL ((I2C_FREQ_MHZ * 1000000U) / (2 * I2C_SPEED_HZ))  // Clock control value
 #define CALC_I2C_TRISE (I2C_FREQ_MHZ + 1) // Rise time calculation (max 1000ns)
@@ -56,6 +74,8 @@
 #define GPIOB_PUPDR     (*(volatile uint32_t*)(GPIOB_BASE + 0x0C)) // Pull-up/Pull-down Register
 #define GPIOB_AFRL      (*(volatile uint32_t*)(GPIOB_BASE + 0x20)) // Alternate Function Low Register
 
+#define DEFAULT_VALUE 0xFF // Default value for uninitialized registers
+
 // Default I2C device address and register mapping
 static uint8_t LED_I2C_ADDR =   0x44; // Default I2C slave address (7-bit)
 static uint8_t REG_RED      =   0x02; // Red channel PWM register
@@ -68,9 +88,86 @@ static uint8_t ledout =0x00; // Initialized to all channels off
 
 static int is_initialized = 0; // Initialization status flag
 
+static inline int wait_flag(uint32_t flag, uint32_t *reg, int8_t error_code){
+    int timer = I2C_TIMEOUT;
+    while (!(*reg & flag) && (timer-- > 0)) {
+        if (timer == 0) {
+            return error_code; // Timeout error
+        }
+    }
+    return 0; // Success
+}
+static inline int wait_flag_clear(uint32_t flag, uint32_t *reg, int8_t error_code){
+    int timer = I2C_TIMEOUT;
+    while ((*reg & flag) && (timer-- > 0)) {
+        if (timer == 0) {
+            return error_code; // Timeout error
+        }
+    }
+    return 0; // Success
+}
+
+// inline function to set brightness for a specific channel
+static inline int i2c_set_brightness_for_channel(uint8_t channel, uint8_t brightness){
+    if(!is_initialized){
+        return ERROR_NOT_INITIALIZED; 
+    }
+
+    int8_t offset = find_offset(channel);
+    if (offset < 0) {
+        return offset; 
+    }
+    uint8_t mode = (ledout >> offset) & 0x03;
+
+    if (mode != LED_MODE_PWM)
+        return ERROR_CHANNEL_DISABLE;
+    uint8_t send_data[1]={brightness};
+    uint8_t addrs[1]={channel};
+    return _i2c_write_reg(send_data,NULL, 1, addrs);
+}
+
+// inline function to enable a specific channel
+static inline int i2c_enable_channel(uint8_t channel) {
+    if(!is_initialized){
+        return ERROR_NOT_INITIALIZED; 
+    }
+    int8_t offset = find_offset(channel);
+    if (offset < 0) {
+        return ERROR_CHANNEL_NOT_IN_RANGE; 
+    }
+    uint8_t new_ledout = ledout | (0x02 << offset); // Set the channel to PWM mode
+    uint8_t send_data[1] = {new_ledout};
+    uint8_t addrs[1] = {REG_LEDOUT};
+    
+    int8_t ret= _i2c_write_reg(send_data, NULL, 1, addrs);
+    if(ret == 0){
+        ledout = new_ledout; // Update the ledout variable
+    }
+    return ret;
+}
+ 
+// inline function to disable a specific channel
+static inline int i2c_disable_channel(uint8_t channel) {
+    if(!is_initialized){
+        return ERROR_NOT_INITIALIZED; 
+    }
+    int8_t offset = find_offset(channel);
+    if (offset < 0) {
+        return ERROR_CHANNEL_NOT_IN_RANGE; 
+    }
+    uint8_t new_ledout = ledout & ~(0x03 << offset); // Set the channel to OFF mode
+    uint8_t send_data[1] = {new_ledout};
+    uint8_t addrs[1] = {REG_LEDOUT};
+    int8_t ret= _i2c_write_reg(send_data, NULL, 1, addrs);
+    if(ret == 0){
+        ledout = new_ledout; // Update the ledout variable
+    }
+    return ret;
+}
+
 //find offset of channel
 // channel - channel to find offset for (REG_RED, REG_GREEN, REG_BLUE, REG_WHITE)
-static int find_offset (uint32_t channel){
+static inline int find_offset (uint32_t channel){
     if (channel == REG_RED) {
         return 0;
     } else if (channel == REG_GREEN) {
@@ -86,93 +183,80 @@ static int find_offset (uint32_t channel){
 
 // Send STOP in I2C bus
 static inline void i2c_generate_stop(void) {
-    I2C1_CR1 |= (1 << 9);
+    I2C1_CR1 |= I2C_CR1_STOP;
 }
 
 // Send START in I2C bus
 static int i2c_generate_start(void) {
-    I2C1_CR1 &= ~(1<<8);
-    int timer = I2C_TIMEOUT;
+    I2C1_CR1 &= ~I2C_CR1_START;
     // Check for bus not busy
-    while ((I2C1_SR2 & (1 << 1)) && (timer-- > 0)) {
-        if (timer == 0) return ERROR_BUSY_BUS;
+    int ret =0;
+    ret = wait_flag_clear(I2C_SR2_BUSY, &I2C1_SR2, ERROR_BUSY_BUS); // Wait for bus not busy
+    if (ret != 0) {
+        return ret; 
     }
 
     // Generation START condition
-    I2C1_CR1 |= (1 << 8); // Старт-бит
+    I2C1_CR1 |= I2C_CR1_START; // Старт-бит
 
     // Start Bit await
-    timer = I2C_TIMEOUT;
-    while (!(I2C1_SR1 & (1 << 0)) && (timer-- > 0)) {
-        if (timer == 0) {
-            i2c_generate_stop(); 
-            return ERROR_SB;
-        }
+    ret = wait_flag(I2C_SR1_SB, &I2C1_SR1, ERROR_SB); // Wait for start bit
+    if (ret != 0) {
+        return ret; 
     }
-    return 0;
+    return 0; // Success
     
 }
 // Send multiple data to I2C bus
 static int8_t i2c_send_multiple_data(uint8_t data[],uint8_t *error_mask, uint8_t count, uint8_t start_addr[]){
-    int timer = I2C_TIMEOUT;
     int first_error = 0; 
     I2C1_DR = LED_I2C_ADDR << 1; // write bit
     uint8_t mask = 0;
-
+    int ret =0;
     // ADDR  flag await
-    timer = I2C_TIMEOUT;
-    while (!(I2C1_SR1 & (1 << 1)) && (timer-- > 0)) {
-        if (timer == 0) {
-            return ERROR_ADDR;
-        }
+    ret = wait_flag(I2C_SR1_ADDR, &I2C1_SR1, ERROR_ADDR); // Wait for ADDR flag
+    if (ret != 0) {
+        return ret; 
     }
     (void)I2C1_SR1; 
     (void)I2C1_SR2; 
 
     // Check for ACK Failure 
-    if (I2C1_SR1 & (1<<10)) { I2C1_SR1 &= ~(1<<10); return ERROR_ACK_FAIL; }
+    if (I2C1_SR1 & I2C_SR1_ACK_FAIL) { I2C1_SR1 &= ~I2C_SR1_ACK_FAIL; return ERROR_ACK_FAIL; }
 
     for(uint8_t i=0; i<count; i++){
         // Send reg address
-        timer = I2C_TIMEOUT;
-        while (!(I2C1_SR1 & (1 << 7)) && (timer-- > 0)) { // TXE flag
-            if (timer == 0) {
-                first_error= ERROR_TXE;
-                mask |= (1 << i);
-                break;
-            }
+        ret = wait_flag(I2C_SR1_TXE, &I2C1_SR1, ERROR_TXE); // Wait for TXE flag
+        if (ret != 0) {
+            first_error= ERROR_TXE;
+            mask |= (1 << i);
+            break;
         }
+
         I2C1_DR = start_addr[i];
 
-        timer = I2C_TIMEOUT;
-        if (I2C1_SR1 & (1<<10)) {  return ERROR_ACK_FAIL; }
+        if (I2C1_SR1 & I2C_SR1_ACK_FAIL) {  return ERROR_ACK_FAIL; }
 
         // Data transfer readiness await
-        timer = I2C_TIMEOUT;
-        while (!(I2C1_SR1 & (1 << 7)) && (timer-- > 0)) { // TXE
-            if (timer == 0) {
-                first_error=  ERROR_TXE;
-                I2C1_SR1 &= ~(1<<10);
-                mask |= (1 << i);
-                break;
-            }
+        ret = wait_flag(I2C_SR1_TXE, &I2C1_SR1, ERROR_TXE); // Wait for TXE flag
+        if (ret != 0) {
+            first_error= ERROR_TXE;
+            mask |= (1 << i);
+            break;
         }
 
         // Send value
         I2C1_DR = data[i];
 
-        timer = I2C_TIMEOUT;
-        if (I2C1_SR1 & (1<<10)) { I2C1_SR1 &= ~(1<<10);return ERROR_ACK_FAIL; }
+        
+        if (I2C1_SR1 & I2C_SR1_ACK_FAIL) { I2C1_SR1 &= ~I2C_SR1_ACK_FAIL;return ERROR_ACK_FAIL; }
 
         // Wait for the transfer to complete 
-        timer = I2C_TIMEOUT;
-        while (!(I2C1_SR1 & (1 << 2)) && (timer-- > 0)) {
-            if (timer == 0) {
-                first_error=  ERROR_TRANSFER;
-                I2C1_SR1 &= ~(1<<10);
-                mask |= (1 << i);
-                break;
-            }
+        ret = wait_flag(I2C_SR1_BTF, &I2C1_SR1, ERROR_TRANSFER); // Wait for BTF flag
+        if (ret != 0) {
+            first_error= ERROR_TRANSFER;
+            mask |= (1 << i);
+            break;
         }
     (void)I2C1_SR1;
     }
@@ -194,99 +278,89 @@ static int _i2c_write_reg(uint8_t value[], uint8_t *error_mask, uint8_t count, u
     return ret;
 }
 
-static uint8_t _i2c_read_reg_ledout(void){
-
-    (void)I2C1_SR1; // Clear ADDR flag
-    (void)I2C1_SR2; // Clear ADDR flag
-    int timer = I2C_TIMEOUT;
-    while((I2C1_SR2 &(1<<1))&&(timer-- >0)){
-        if(timer ==0 ){
-            return ERROR_BUSY_BUS;
-        }
+static int8_t _i2c_read_reg_ledout(void) {
+    int ret =0;
+    if(!is_initialized){
+        ret = ERROR_NOT_INITIALIZED; 
+        return ret;
     }
+    
+    (void)I2C1_SR1; 
+    (void)I2C1_SR2; // Clear ADDR flag
 
-    I2C1_CR1 |= (1<<8); // start bit
-    timer = I2C_TIMEOUT;
+    ret = wait_flag_clear(I2C_SR2_BUSY, &I2C1_SR2, ERROR_BUSY_BUS); // Wait for bus not busy
+    
+    if (ret != 0) {
+        return ret; 
+    }
+    
 
-    while(! ((I2C1_SR1 &(1<<0))) && (timer-- >0)){
-        if(timer ==0 ){
-            return ERROR_SB;
-        }
+    I2C1_CR1 |= I2C_CR1_START; 
+    
+    ret = wait_flag(I2C_SR1_SB, &I2C1_SR1, ERROR_SB); // Wait for start bit
+    if (ret != 0) {
+        return ret; 
     }
 
     I2C1_DR= LED_I2C_ADDR<<1 | 0; // write bit
 
-    timer = I2C_TIMEOUT;
-    while(!((I2C1_SR1 &(1<<1))) && (timer-- >0)){
-        if(timer ==0 ){
-            return ERROR_ADDR;
-        }
+    ret = wait_flag(I2C_SR1_ADDR, &I2C1_SR1, ERROR_ADDR); 
+    if (ret != 0) {
+        return ret; 
     }
 
-
-    (void)I2C1_SR1; // Clear ADDR flag
+    (void)I2C1_SR1; 
     (void)I2C1_SR2; // Clear ADDR flag
 
-    timer = I2C_TIMEOUT;
-    while(!((I2C1_SR1 &(1<<7))) && (timer-- >0)){
-        if(timer ==0 ){
-            return ERROR_TXE;
-        }
+    ret = wait_flag(I2C_SR1_TXE, &I2C1_SR1, ERROR_TXE); // Wait for TXE flag
+    if (ret != 0) {
+        return ret; 
     }
 
     I2C1_DR=REG_LEDOUT; // send register address
 
-    timer = I2C_TIMEOUT;
-    while(!((I2C1_SR1 &(1<<2)))&& (timer-- >0)){
-        if(timer ==0){
-            return ERROR_TRANSFER;
-        }
+    ret = wait_flag(I2C_SR1_BTF, &I2C1_SR1, ERROR_TRANSFER); // Wait for BTF flag
+    if (ret != 0) {
+        return ret; 
     }
 
     I2C1_CR1 |= (1<<8); // start bit
 
-    timer = I2C_TIMEOUT;
-    while(!((I2C1_SR1 & (1<<0)))&&(timer-- >0)){
-        if(timer ==0){
-            return ERROR_SB;
-        }
+    ret = wait_flag(I2C_SR1_SB, &I2C1_SR1, ERROR_SB); // Wait for start bit
+    if (ret != 0) {
+        return ret; 
     }
 
     I2C1_DR=LED_I2C_ADDR<<1|0x01; // read bit
 
-    timer = I2C_TIMEOUT;
-    while(!( (I2C1_SR1 &(1<<1))) &&(timer-- >0)){
-        if(timer ==0){
-            return ERROR_ADDR;
-        }
+    ret = wait_flag(I2C_SR1_ADDR, &I2C1_SR1, ERROR_ADDR); // Wait for ADDR flag
+    if (ret != 0) {
+        return ret; 
     }
 
-    I2C1_CR1&=~(1<<10) ; // disable ACK bit
+    I2C1_CR1&=~I2C_CR1_ACK ; // disable ACK bit
     (void)I2C1_SR1; // Clear ADDR flag
     (void)I2C1_SR2; // Clear ADDR flag
 
-    I2C1_CR1 |= (1<<9); // stop bit
+    I2C1_CR1 |= I2C_CR1_STOP; // stop bit
 
-    timer = I2C_TIMEOUT;
-    while ( !(I2C1_SR1 & (1<<6)) && (timer-- > 0) ){
-        if(timer ==0){
-            return ERROR_RXNE;
-        }
+    ret = wait_flag(I2C_SR1_RXNE, &I2C1_SR1, ERROR_RXNE); // Wait for RXNE flag
+    if (ret != 0) {
+        return ret; 
     }
 
-    uint8_t ledout = I2C1_DR; 
+    ledout = (uint8_t)I2C1_DR; 
 
-    timer = I2C_TIMEOUT;
-    while(((I2C1_SR2 &(1<<1))&&(timer-- >0))){
-        if(timer ==0 ){
-            return ERROR_BUSY_BUS;
-        }
+    (void)I2C1_SR1;
+
+    ret = wait_flag_clear(I2C_SR1_RXNE, &I2C1_SR1, ERROR_RXNE); // Wait for RXNE flag
+    if (ret != 0) {
+        return ret; 
     }
-    I2C1_CR1 |= (1 << 10); // enable ACK bit
-
-    return ledout;
-
-}
+    
+    I2C1_CR1 |= I2C_CR1_ACK; // enable ACK bit
+    return ret; // Success
+}   
 
 int rgbw_init(uint8_t i2c_addr, uint8_t reg_red_addr, uint8_t reg_green_addr,
                                 uint8_t reg_blue_addr,uint8_t reg_white_addr) {
@@ -297,19 +371,19 @@ int rgbw_init(uint8_t i2c_addr, uint8_t reg_red_addr, uint8_t reg_green_addr,
     
     int8_t ret =0;                                
     
-    if(i2c_addr!= 0){
+    if(i2c_addr!= DEFAULT_VALUE ){
         LED_I2C_ADDR = i2c_addr;
     }
-    if(reg_red_addr!= 0){
+    if(reg_red_addr!= DEFAULT_VALUE ){
         REG_RED = reg_red_addr;
     }
-    if(reg_green_addr!= 0){
+    if(reg_green_addr!= DEFAULT_VALUE){
         REG_GREEN = reg_green_addr;
     }
-    if(reg_blue_addr!= 0){
+    if(reg_blue_addr!= DEFAULT_VALUE){
         REG_BLUE = reg_blue_addr;
     }
-    if(reg_white_addr!= 0){
+    if(reg_white_addr!= DEFAULT_VALUE){
         REG_WHITE = reg_white_addr;
     }
 
@@ -325,11 +399,11 @@ int rgbw_init(uint8_t i2c_addr, uint8_t reg_red_addr, uint8_t reg_green_addr,
     GPIOB_AFRL &= ~((0xF << 24) | (0xF << 28));   
     GPIOB_AFRL |=  ((0x4 << 24) | (0x4 << 28));// AF4 for I2C
     
-    I2C1_CR1 &= ~(1 << 0); // disable CR1 
+    I2C1_CR1 &= ~I2C_CR1_PE; // disable CR1 
     I2C1_CR2=I2C_FREQ_MHZ; // set speed
     I2C_CCR = I2C_CCR_VAL; // 
     I2C_TRISE = CALC_I2C_TRISE; // set rise time
-    I2C1_CR1 |= (1<<0);
+    I2C1_CR1 |= I2C_CR1_PE; // enable I2C1
 
     uint8_t mode_data[] = {0x00, 0x04}; // MODE1=0x00 (SLEEP=0), MODE2=0x04 (OUTDRV=1)
     uint8_t mode_addrs[] = {0x00, 0x01};
@@ -351,6 +425,9 @@ int rgbw_init(uint8_t i2c_addr, uint8_t reg_red_addr, uint8_t reg_green_addr,
 }
 
 int rgbw_set_color(uint8_t r, uint8_t g, uint8_t b, uint8_t w, uint8_t *error_mask) {
+    if(!is_initialized){
+        return ERROR_NOT_INITIALIZED; 
+    }
     uint8_t send_data[4]={r,g,b,w};
     uint8_t addrs[4]={REG_RED,REG_GREEN,REG_BLUE,REG_WHITE};
     int ret= _i2c_write_reg(send_data, error_mask,4,addrs);
@@ -358,240 +435,52 @@ int rgbw_set_color(uint8_t r, uint8_t g, uint8_t b, uint8_t w, uint8_t *error_ma
 }
 
 int rgbw_set_red(uint8_t r){
-
-    int8_t offset = find_offset(REG_RED);
-    uint8_t mode = (ledout >> offset) & 0x03;
-
-    if (mode != LED_MODE_PWM)
-        return ERROR_CHANNEL_DISABLE;
-
-    uint8_t send_data[1]={r};
-    uint8_t addrs[1]={REG_RED};
-
-    return _i2c_write_reg(send_data,NULL,1, addrs);
+    return i2c_set_brightness_for_channel(REG_RED, r);
 }
 
 int rgbw_set_green(uint8_t g){
-    int8_t offset = find_offset(REG_GREEN);
-    uint8_t mode = (ledout >> offset) & 0x03;
-
-    if (mode != LED_MODE_PWM)
-        return ERROR_CHANNEL_DISABLE;
-    uint8_t send_data[1]={g};
-    uint8_t addrs[1]={REG_GREEN};
-
-    return _i2c_write_reg(send_data,NULL, 1, addrs);
+    return i2c_set_brightness_for_channel(REG_GREEN, g);
 }
 
 int rgbw_set_blue(uint8_t b){
-    int8_t offset = find_offset(REG_BLUE);
-    uint8_t mode = (ledout >> offset) & 0x03;
-
-    if (mode != LED_MODE_PWM)
-        return ERROR_CHANNEL_DISABLE;
-    uint8_t send_data[1]={b};
-    uint8_t addrs[1]={REG_BLUE};
-    return _i2c_write_reg(send_data,NULL, 1, addrs);
+    return i2c_set_brightness_for_channel(REG_BLUE, b);
 }
 
 int rgbw_set_white(uint8_t w){
-    int8_t offset = find_offset(REG_WHITE);
-    uint8_t mode = (ledout >> offset) & 0x03;
-
-    if (mode != LED_MODE_PWM)
-        return ERROR_CHANNEL_DISABLE;
-    uint8_t send_data[1]={w};
-    uint8_t addrs[1]={REG_WHITE};
-    return _i2c_write_reg(send_data,NULL, 1, addrs);
+    return i2c_set_brightness_for_channel(REG_WHITE, w);
 }
 
 int rgbw_disable_red(void) {
-
-    int8_t offset = find_offset(REG_RED);
-    uint8_t new_ledout = ledout;
-
-    uint8_t mode = (ledout >> offset) & 0x03;
-    if (mode == LED_MODE_OFF)
-        return 0;
-
-    if(offset<0){
-        return offset;
-    }
-
-    new_ledout &= ~(0x03 << offset);
-    uint8_t send_data[1]={new_ledout};
-    uint8_t addrs[1]={REG_LEDOUT};
-
-    int8_t ret= _i2c_write_reg(send_data, NULL, 1, addrs);
-    if(ret == 0){
-        ledout = new_ledout;
-    }
-    return ret;
+    return i2c_disable_channel(REG_RED);
 }
 
 int rgbw_disable_green(void) {
-
-    int8_t offset = find_offset(REG_GREEN);
-    uint8_t new_ledout = ledout;
-
-    uint8_t mode = (ledout >> offset) & 0x03;
-    if (mode == LED_MODE_OFF)
-        return 0;
-
-    if(offset<0){
-        return offset;
-    }
-
-    new_ledout &= ~(0x03 << offset);
-    uint8_t send_data[1]={new_ledout};
-    uint8_t addrs[1]={REG_LEDOUT};
-
-    int8_t ret= _i2c_write_reg(send_data, NULL, 1, addrs);
-    if(ret == 0){
-        ledout = new_ledout;
-    }
-    return ret;
+    return i2c_disable_channel(REG_GREEN);
 }
 
 int rgbw_disable_blue(void) {
-
-    int8_t offset = find_offset(REG_BLUE);
-    uint8_t new_ledout = ledout;
-
-    uint8_t mode = (ledout >> offset) & 0x03;
-    if (mode == LED_MODE_OFF)
-        return 0;
-
-    if(offset<0){
-        return offset;
-    }
-
-    new_ledout &= ~(0x03 << offset);
-    uint8_t send_data[1]={new_ledout};
-    uint8_t addrs[1]={REG_LEDOUT};
-
-    int8_t ret= _i2c_write_reg(send_data, NULL, 1, addrs);
-    if(ret == 0){
-        ledout = new_ledout;
-    }
-    return ret;
+    return i2c_disable_channel(REG_BLUE);
 }
 
 int rgbw_disable_white(void) {
-
-    int8_t offset = find_offset(REG_WHITE);
-    uint8_t new_ledout = ledout;
-
-    uint8_t mode = (ledout >> offset) & 0x03;
-    if (mode == LED_MODE_OFF)
-        return 0;
-
-    if(offset<0){
-        return offset;
-    }
-
-    new_ledout &= ~(0x03 << offset);
-    uint8_t send_data[1]={new_ledout};
-    uint8_t addrs[1]={REG_LEDOUT};
-
-    int8_t ret= _i2c_write_reg(send_data, NULL, 1, addrs);
-    if(ret == 0){
-        ledout = new_ledout;
-    }
-    return ret;
+    return i2c_disable_channel(REG_WHITE);
 }
 
 int rgbw_enable_red(void) {
-    int8_t offset = find_offset(REG_RED);
-    uint8_t new_ledout = ledout;
-    if(offset<0){
-        return offset;
-    }
-
-    uint8_t mode = (ledout >> offset) & 0x03;
-    if (mode == LED_MODE_PWM)
-        return 0;    
-
-    new_ledout &= ~(0x03 << offset);
-    new_ledout |=  (0b10 << offset);
-    uint8_t send_data[1]={new_ledout};
-    uint8_t addrs[1]={REG_LEDOUT};
-    
-    int8_t ret =_i2c_write_reg(send_data, NULL, 1, addrs);
-    if(ret == 0){
-        ledout = new_ledout;
-    }
-    return ret;
+    return i2c_enable_channel(REG_RED);
 }
 
 
 int rgbw_enable_green(void) {
-    int8_t offset = find_offset(REG_GREEN);
-    uint8_t new_ledout = ledout;
-    if(offset<0){
-        return offset;
-    }
-
-    uint8_t mode = (ledout >> offset) & 0x03;
-    if (mode == LED_MODE_PWM)
-        return 0;    
-
-    new_ledout &= ~(0x03 << offset);
-    new_ledout |=  (0b10 << offset);
-    uint8_t send_data[1]={new_ledout};
-    uint8_t addrs[1]={REG_LEDOUT};
-    
-    int8_t ret =_i2c_write_reg(send_data, NULL, 1, addrs);
-    if(ret == 0){
-        ledout = new_ledout;
-    }
-    return ret;
+    return i2c_enable_channel(REG_GREEN);
 }
 
 int rgbw_enable_blue(void) {
-    int8_t offset = find_offset(REG_BLUE);
-    uint8_t new_ledout = ledout;
-    if(offset<0){
-        return offset;
-    }
-
-    uint8_t mode = (ledout >> offset) & 0x03;
-    if (mode == LED_MODE_PWM)
-        return 0;    
-
-    new_ledout &= ~(0x03 << offset);
-    new_ledout |=  (0b10 << offset);
-    uint8_t send_data[1]={new_ledout};
-    uint8_t addrs[1]={REG_LEDOUT};
-    
-    int8_t ret =_i2c_write_reg(send_data, NULL, 1, addrs);
-    if(ret == 0){
-        ledout = new_ledout;
-    }
-    return ret;
+    return i2c_enable_channel(REG_BLUE);
 }
 
 int rgbw_enable_white(void) {
-    int8_t offset = find_offset(REG_WHITE);
-    uint8_t new_ledout = ledout;
-    if(offset<0){
-        return offset;
-    }
-
-    uint8_t mode = (ledout >> offset) & 0x03;
-    if (mode == LED_MODE_PWM)
-        return 0;    
-
-    new_ledout &= ~(0x03 << offset);
-    new_ledout |=  (0b10 << offset);
-    uint8_t send_data[1]={new_ledout};
-    uint8_t addrs[1]={REG_LEDOUT};
-    
-    int8_t ret =_i2c_write_reg(send_data, NULL, 1, addrs);
-    if(ret == 0){
-        ledout = new_ledout;
-    }
-    return ret;
+    return i2c_enable_channel(REG_WHITE);
 }
 
 int rgbw_enable_all(void){
@@ -616,9 +505,15 @@ int rgbw_disable_all(void){
     return ret;
 }
 
-int rgbw_read_ledout(void) {
-    return _i2c_read_reg_ledout();
+int8_t rgbw_read_ledout(uint8_t *out) {
+    int8_t ret = _i2c_read_reg_ledout();
+    if (ret != 0) 
+        return ret;
+    if (out) 
+        *out = ledout;
+    return 0;
 }
+
 
 int rgbw_deinit(void){
     if (!is_initialized) {
@@ -636,7 +531,7 @@ int rgbw_deinit(void){
     if(ret !=0){
         return ret;
     }
-    I2C1_CR1 &= ~(1 << 0);
+    I2C1_CR1 &= ~I2C_CR1_PE; // Disable I2C1
 
     GPIOB_MODER &= ~((3<<12) | (3<<14));
     GPIOB_OTYPER &= ~((1 << 6) | (1 << 7));
@@ -649,4 +544,3 @@ int rgbw_deinit(void){
 int rgbw_is_initialized(void) {
     return is_initialized;
 }
-
