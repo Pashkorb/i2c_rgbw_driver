@@ -170,7 +170,6 @@ static inline int i2c_disable_channel(uint8_t channel) {
 }
 
 //find offset of channel
-// channel - channel to find offset for (REG_RED, REG_GREEN, REG_BLUE, REG_WHITE)
 static inline int find_offset (uint32_t channel){
     if (channel == REG_RED) {
         return 0;
@@ -213,7 +212,7 @@ static int i2c_generate_start(void) {
     }
 
     // Generation START condition
-    I2C1_CR1 |= I2C_CR1_START; // Старт-бит
+    I2C1_CR1 |= I2C_CR1_START; 
 
     // Start Bit await
     ret = wait_flag(I2C_SR1_SB, &I2C1_SR1, ERROR_SB); // Wait for start bit
