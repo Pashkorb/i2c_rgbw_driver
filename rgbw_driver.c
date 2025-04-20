@@ -13,6 +13,8 @@
 #define ERROR_RXNE -9
 #define ERROR_BUSY_BUS -10
 #define ERROR_NOT_INITIALIZED -11
+#define ERROR_BUS_ERROR -12
+#define ERROR_ARBITRATION_LOST -13
 
 /* I2C Control Register 1 (CR1) */
 #define I2C_CR1_START       (1 << 8)   // Bit 8: START generation 
@@ -26,6 +28,8 @@
 #define I2C_SR1_BTF         (1 << 2)   // Bit 2: Byte Transfer Finished 
 #define I2C_SR1_RXNE        (1 << 6)   // Bit 6: Receive data register not empty 
 #define I2C_SR1_TXE         (1 << 7)   // Bit 7: Transmit data register empty 
+#define I2C_SR1_BERR        (1 << 8)   // Bit 8: Bus error
+#define I2C_SR1_ARLO        (1 << 9)   // Bit 9: Arbitration lost (master mode)
 #define I2C_SR1_ACK_FAIL    (1 << 10)  // Bit 10: Acknowledge failure 
 
 /* I2C Status Register 2 (SR2) */
@@ -74,7 +78,7 @@
 #define GPIOB_PUPDR     (*(volatile uint32_t*)(GPIOB_BASE + 0x0C)) // Pull-up/Pull-down Register
 #define GPIOB_AFRL      (*(volatile uint32_t*)(GPIOB_BASE + 0x20)) // Alternate Function Low Register
 
-#define DEFAULT_VALUE 0xFF // Default value for uninitialized registers
+#define RGBW_USE_DEFAULT 0xFF // Default value for uninitialized registers
 
 // Default I2C device address and register mapping
 static uint8_t LED_I2C_ADDR =   0x44; // Default I2C slave address (7-bit)
@@ -182,8 +186,20 @@ static inline int find_offset (uint32_t channel){
 }
 
 // Send STOP in I2C bus
-static inline void i2c_generate_stop(void) {
+static inline int i2c_generate_stop(void) {
     I2C1_CR1 |= I2C_CR1_STOP;
+
+    if(I2C1_SR1 & I2C_SR1_BERR) { // Check for bus error
+        I2C1_SR1 &= ~I2C_SR1_BERR; // Clear bus error flag
+        return ERROR_BUS_ERROR; 
+    }
+
+    if (I2C1_SR1 & I2C_SR1_ARLO) {
+        I2C1_SR1 &= ~I2C_SR1_ARLO;
+        return ERROR_ARBITRATION_LOST; 
+    }
+
+    return 0; // Success
 }
 
 // Send START in I2C bus
@@ -204,6 +220,17 @@ static int i2c_generate_start(void) {
     if (ret != 0) {
         return ret; 
     }
+
+    if(I2C1_SR1 & I2C_SR1_BERR) { // Check for bus error
+        I2C1_SR1 &= ~I2C_SR1_BERR; // Clear bus error flag
+        return ERROR_BUS_ERROR; 
+    }
+
+    if (I2C1_SR1 & I2C_SR1_ARLO) {
+        I2C1_SR1 &= ~I2C_SR1_ARLO;
+        return ERROR_ARBITRATION_LOST; 
+    }
+
     return 0; // Success
     
 }
@@ -235,8 +262,26 @@ static int8_t i2c_send_multiple_data(uint8_t data[],uint8_t *error_mask, uint8_t
 
         I2C1_DR = start_addr[i];
 
-        if (I2C1_SR1 & I2C_SR1_ACK_FAIL) {  return ERROR_ACK_FAIL; }
+        if(I2C1_SR1 & I2C_SR1_BERR) { // Check for bus error
+            I2C1_SR1 &= ~I2C_SR1_BERR; // Clear bus error flag
+            first_error= ERROR_BUS_ERROR;
+            mask |= (1 << i);
+            break;
+        }
 
+        if (I2C1_SR1 & I2C_SR1_ARLO) {
+            I2C1_SR1 &= ~I2C_SR1_ARLO;
+            first_error= ERROR_ARBITRATION_LOST;
+            mask |= (1 << i);
+            break;
+        }
+
+        if (I2C1_SR1 & I2C_SR1_ACK_FAIL) {
+            I2C1_SR1 &= ~I2C_SR1_ACK_FAIL;
+            first_error= ERROR_ACK_FAIL;
+            mask |= (1 << i);
+            break;
+        }
         // Data transfer readiness await
         ret = wait_flag(I2C_SR1_TXE, &I2C1_SR1, ERROR_TXE); // Wait for TXE flag
         if (ret != 0) {
@@ -248,8 +293,12 @@ static int8_t i2c_send_multiple_data(uint8_t data[],uint8_t *error_mask, uint8_t
         // Send value
         I2C1_DR = data[i];
 
-        
-        if (I2C1_SR1 & I2C_SR1_ACK_FAIL) { I2C1_SR1 &= ~I2C_SR1_ACK_FAIL;return ERROR_ACK_FAIL; }
+        if (I2C1_SR1 & I2C_SR1_ACK_FAIL) {
+            I2C1_SR1 &= ~I2C_SR1_ACK_FAIL;
+            first_error= ERROR_ACK_FAIL;
+            mask |= (1 << i);
+            break;
+        }
 
         // Wait for the transfer to complete 
         ret = wait_flag(I2C_SR1_BTF, &I2C1_SR1, ERROR_TRANSFER); // Wait for BTF flag
@@ -274,7 +323,8 @@ static int _i2c_write_reg(uint8_t value[], uint8_t *error_mask, uint8_t count, u
         return ret;
     }
     ret = i2c_send_multiple_data(value, error_mask, count, start_addr);
-    i2c_generate_stop(); 
+    
+    ret=i2c_generate_stop(); 
     return ret;
 }
 
@@ -303,6 +353,16 @@ static int8_t _i2c_read_reg_ledout(void) {
     }
 
     I2C1_DR= LED_I2C_ADDR<<1 | 0; // write bit
+
+    if(I2C1_SR1 & I2C_SR1_BERR) { // Check for bus error
+        I2C1_SR1 &= ~I2C_SR1_BERR; // Clear bus error flag
+        return ERROR_BUS_ERROR; 
+    }
+
+    if (I2C1_SR1 & I2C_SR1_ARLO) {
+        I2C1_SR1 &= ~I2C_SR1_ARLO;
+        return ERROR_ARBITRATION_LOST; 
+    }
 
     ret = wait_flag(I2C_SR1_ADDR, &I2C1_SR1, ERROR_ADDR); 
     if (ret != 0) {
@@ -333,6 +393,16 @@ static int8_t _i2c_read_reg_ledout(void) {
 
     I2C1_DR=LED_I2C_ADDR<<1|0x01; // read bit
 
+    if(I2C1_SR1 & I2C_SR1_BERR) { // Check for bus error
+        I2C1_SR1 &= ~I2C_SR1_BERR; // Clear bus error flag
+        return ERROR_BUS_ERROR; 
+    }
+
+    if (I2C1_SR1 & I2C_SR1_ARLO) {
+        I2C1_SR1 &= ~I2C_SR1_ARLO;
+        return ERROR_ARBITRATION_LOST; 
+    }
+    
     ret = wait_flag(I2C_SR1_ADDR, &I2C1_SR1, ERROR_ADDR); // Wait for ADDR flag
     if (ret != 0) {
         return ret; 
@@ -357,6 +427,11 @@ static int8_t _i2c_read_reg_ledout(void) {
     if (ret != 0) {
         return ret; 
     }
+
+    ret = wait_flag_clear(I2C_SR2_BUSY, &I2C1_SR2, ERROR_BUSY_BUS); // Wait for bus not busy
+    if( ret != 0) {
+        return ret; 
+    }
     
     I2C1_CR1 |= I2C_CR1_ACK; // enable ACK bit
     return ret; // Success
@@ -371,19 +446,19 @@ int rgbw_init(uint8_t i2c_addr, uint8_t reg_red_addr, uint8_t reg_green_addr,
     
     int8_t ret =0;                                
     
-    if(i2c_addr!= DEFAULT_VALUE ){
+    if(i2c_addr!= RGBW_USE_DEFAULT ){
         LED_I2C_ADDR = i2c_addr;
     }
-    if(reg_red_addr!= DEFAULT_VALUE ){
+    if(reg_red_addr!= RGBW_USE_DEFAULT ){
         REG_RED = reg_red_addr;
     }
-    if(reg_green_addr!= DEFAULT_VALUE){
+    if(reg_green_addr!= RGBW_USE_DEFAULT){
         REG_GREEN = reg_green_addr;
     }
-    if(reg_blue_addr!= DEFAULT_VALUE){
+    if(reg_blue_addr!= RGBW_USE_DEFAULT){
         REG_BLUE = reg_blue_addr;
     }
-    if(reg_white_addr!= DEFAULT_VALUE){
+    if(reg_white_addr!= RGBW_USE_DEFAULT){
         REG_WHITE = reg_white_addr;
     }
 

@@ -4,17 +4,19 @@
 
 /* Driver error codes */
 #define RGBW_OK                      0   // Success
-#define RGBW_ERROR_SB               -1   // Start Bit timeout
-#define RGBW_ERROR_TXE              -2   // TXE timeout
-#define RGBW_ERROR_ADDR             -3   // Address timeout
-#define RGBW_ERROR_CHANNEL_DISABLE  -4   // Channel disabled
-#define RGBW_ERROR_CHANNEL_RANGE    -5   // Invalid channel
-#define RGBW_ERROR_TRANSFER         -6   // Transfer timeout
-#define RGBW_ERROR_ACK_FAIL        -7   // ACK failure
-#define RGBW_ERROR_REINIT          -8   // Reinitialization attempt
-#define RGBW_ERROR_RXNE            -9   // RXNE timeout
-#define RGBW_ERROR_BUS_BUSY        -10  // Bus busy timeout
+#define RGBW_ERROR_SB               -1   // Start condition not generated (I2C bus issue)
+#define RGBW_ERROR_TXE              -2   // Data register not ready for transmission
+#define RGBW_ERROR_ADDR             -3   // Address transmission failed
+#define RGBW_ERROR_CHANNEL_DISABLE  -4   // Attempt to set disabled channel
+#define RGBW_ERROR_CHANNEL_RANGE    -5   // Invalid channel specified
+#define RGBW_ERROR_TRANSFER         -6   // Data transfer not completed
+#define RGBW_ERROR_ACK_FAIL        -7   // No acknowledgment received
+#define RGBW_ERROR_REINIT          -8   // Reinitialization attempted while active
+#define RGBW_ERROR_RXNE            -9   // Receive buffer not ready
+#define RGBW_ERROR_BUS_BUSY        -10  // I2C bus unavailable (timeout)
 #define RGBW_ERROR_NOT_INIT        -11  // Driver not initialized
+#define RGBW_ERROR_BUS_ERROR       -12  // I2C bus error (signal fault)
+#define RGBW_ERROR_ARB_LOST       -13  // I2C arbitration lost (multi-master conflict)
 
 /* Default configuration values */
 #define RGBW_DEFAULT_ADDR      0x44
@@ -77,8 +79,8 @@ int rgbw_disable_all(void);
 
 /**
   * @brief  Read LEDOUT register
-  * @retval Positive value (0-255) = register value,
-  *         Negative value = error code
+  * @param  ledout: Pointer to store the LEDOUT register value (0-255)
+  * @return RGBW_OK on success, error code otherwise
   */
 int8_t rgbw_read_ledout(uint8_t *ledout);
 
